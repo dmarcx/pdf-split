@@ -213,20 +213,27 @@ def _parse_manifest_xml(zf: zipfile.ZipFile, path: str) -> dict:
         if version_attr:
             dwf_version = version_attr
 
-        # Look for Section, Page, or similar child elements
+        # Look for Section elements (DWF manifest uses <dwf:Section ...>)
         for child in root.iter():
             ctag = _strip_ns(child.tag)
-            if ctag in ("Section", "Page", "Sheet", "Resource"):
-                name = child.get("name") or child.get("title") or child.get("label") or ""
-                role = child.get("role") or child.get("type") or ctag
-                descriptor = child.get("descriptor") or ""
-                resource = child.get("href") or child.get("resource") or ""
-                if name or descriptor or resource:
+            if ctag == "Section":
+                name = child.get("name") or ""
+                title = child.get("title") or child.get("label") or name
+                role = child.get("type") or child.get("role") or ctag
+                # Find descriptor path from nested <Toc><Resource role="descriptor">
+                descriptor = ""
+                for res in child.iter():
+                    if _strip_ns(res.tag) == "Resource":
+                        if "descriptor" in (res.get("role") or "").lower():
+                            descriptor = (res.get("href") or "").replace("\\", "/")
+                            break
+                if name or title or descriptor:
                     sections.append({
                         "name": name,
+                        "title": title,
                         "role": role,
                         "descriptor": descriptor,
-                        "resource_path": resource,
+                        "resource_path": "",
                     })
 
     except Exception:
@@ -313,24 +320,30 @@ def parse_section_descriptor(zf: zipfile.ZipFile, descriptor_path: str) -> dict:
             except (ValueError, TypeError):
                 pass
 
-        # Dimensions - look for Paper, Page, or Size elements
-        for el in root.iter():
-            etag = _strip_ns(el.tag)
-            if etag in ("Paper", "Page", "Size", "Dimensions"):
-                w = el.get("width") or el.get("w")
-                h = el.get("height") or el.get("h")
-                u = el.get("units") or el.get("unit", "inches")
-                if w:
-                    try:
-                        result["width"] = float(w)
-                    except (ValueError, TypeError):
-                        pass
-                if h:
-                    try:
-                        result["height"] = float(h)
-                    except (ValueError, TypeError):
-                        pass
-                result["units"] = u
+        # Dimensions - look for Paper first (DWF ePlot), then Page/Size/Dimensions
+        # Note: "Page" is often the root element itself (no dimensions), so check
+        # all candidates and prefer ones that actually carry width/height.
+        for etag_target in ("Paper", "Size", "Dimensions", "Page"):
+            for el in root.iter():
+                etag = _strip_ns(el.tag)
+                if etag == etag_target:
+                    w = el.get("width") or el.get("w")
+                    h = el.get("height") or el.get("h")
+                    if w or h:
+                        u = el.get("units") or el.get("unit", "inches")
+                        if w:
+                            try:
+                                result["width"] = float(w)
+                            except (ValueError, TypeError):
+                                pass
+                        if h:
+                            try:
+                                result["height"] = float(h)
+                            except (ValueError, TypeError):
+                                pass
+                        result["units"] = u
+                        break
+            if result["width"] or result["height"]:
                 break
 
         # Resources
@@ -362,10 +375,10 @@ def extract_xml_properties(zf: zipfile.ZipFile) -> dict:
     raw = {}
 
     dc_tags = {
-        "title": ("title",),
+        "title": ("title", "layout name"),
         "author": ("creator", "author"),
-        "date": ("date", "created", "modified"),
-        "software": ("software", "generator", "producer"),
+        "date": ("date", "created", "modified", "creation time", "modification time"),
+        "software": ("software", "generator", "producer", "creator"),
     }
 
     for info in zf.infolist():
@@ -377,6 +390,18 @@ def extract_xml_properties(zf: zipfile.ZipFile) -> dict:
                 continue
             for el in root.iter():
                 tag = _strip_ns(el.tag).lower()
+
+                # DWF stores metadata as <Property name="Author" value="User"/>
+                if tag == "property":
+                    prop_name = (el.get("name") or "").lower()
+                    prop_val = (el.get("value") or el.text or "").strip()
+                    if prop_name and prop_val:
+                        raw[prop_name] = prop_val
+                        for key, aliases in dc_tags.items():
+                            if prop_name in aliases and not meta[key]:
+                                meta[key] = prop_val
+                    continue
+
                 text = (el.text or "").strip()
                 if not text:
                     continue
@@ -851,7 +876,7 @@ def get_dwf_info(filepath: str) -> dict:
                 "index": i,
                 "name": sec.get("name", ""),
                 "role": sec.get("role", ""),
-                "label": desc.get("label", sec.get("name", "")),
+                "label": desc.get("label") or sec.get("title") or sec.get("name", ""),
                 "page_number": desc.get("page_number"),
                 "width": desc.get("width", 0.0),
                 "height": desc.get("height", 0.0),
