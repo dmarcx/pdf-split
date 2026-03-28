@@ -1,0 +1,17 @@
+# DWF MCP Server dependencies
+# Install with: pip install -r requirements_dwf.txt
+
+# Required: MCP framework
+mcp>=1.0.0
+
+# Required: already installed (v1.4.2) - used for Tier 2 geometry via DXF
+ezdxf>=1.4.0
+
+# Optional (Tier 1 - commercial): full DWF support including W2D geometry
+# Uncomment to enable: pip install aspose-cad
+# aspose-cad>=24.0
+
+# For Tier 2 (ODA File Converter + ezdxf):
+# 1. Download ODA File Converter (free) from: https://www.opendesign.com/guestfiles/oda_file_converter
+# 2. Set env var: ODA_CONVERTER_PATH=C:\Program Files\ODA\ODAFileConverter.exe
+# No pip package needed - ODA is an external executable.
