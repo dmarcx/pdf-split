@@ -48,6 +48,32 @@ ASPOSE_AVAILABLE: bool = importlib.util.find_spec("aspose") is not None and (
 ODA_AVAILABLE: bool = bool(ODA_CONVERTER_PATH) and Path(ODA_CONVERTER_PATH).is_file()
 
 
+def _check_tesseract() -> tuple:
+    """Return (available: bool, path: str) for Tesseract OCR engine."""
+    if importlib.util.find_spec("pytesseract") is None:
+        return False, ""
+    try:
+        import pytesseract  # type: ignore
+        pytesseract.get_tesseract_version()
+        return True, pytesseract.pytesseract.tesseract_cmd
+    except Exception:
+        # Try common Windows install path
+        win_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if Path(win_path).is_file():
+            try:
+                import pytesseract
+                pytesseract.pytesseract.tesseract_cmd = win_path
+                pytesseract.get_tesseract_version()
+                return True, win_path
+            except Exception:
+                pass
+    return False, ""
+
+
+_TESSERACT_AVAILABLE, _TESSERACT_PATH = _check_tesseract()
+TESSERACT_AVAILABLE: bool = _TESSERACT_AVAILABLE
+
+
 def detect_backend() -> dict:
     """Return dict describing available parsing backends."""
     return {
@@ -55,6 +81,7 @@ def detect_backend() -> dict:
         "oda": ODA_AVAILABLE,
         "oda_path": ODA_CONVERTER_PATH if ODA_AVAILABLE else "",
         "ezdxf": importlib.util.find_spec("ezdxf") is not None,
+        "tesseract": TESSERACT_AVAILABLE,
     }
 
 
@@ -518,6 +545,146 @@ def _float_attr(el: ET.Element, *attr_names: str) -> Optional[float]:
             except (ValueError, TypeError):
                 pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# Tier 0.5: Tesseract OCR on raster images embedded in DWF
+# ---------------------------------------------------------------------------
+
+def extract_raster_sections(zf: zipfile.ZipFile) -> list:
+    """
+    Find raster image files (TIFF/PNG) inside the DWF archive.
+
+    Returns list of dicts:
+        {path, mime, section_name, role}
+    """
+    rasters = []
+    names = {info.filename for info in zf.infolist()}
+
+    # Parse manifest to find raster overlay / thumbnail resources
+    manifest_data = None
+    for name in names:
+        if "manifest" in name.lower() and name.endswith(".xml"):
+            try:
+                root = _parse_xml_safe(zf.read(name))
+                if root is not None:
+                    manifest_data = root
+                    break
+            except Exception:
+                pass
+
+    if manifest_data is not None:
+        for el in manifest_data.iter():
+            etag = _strip_ns(el.tag)
+            if etag in ("Resource", "ImageResource"):
+                role = el.get("role") or ""
+                href = (el.get("href") or "").replace("\\", "/")
+                mime = el.get("mime") or ""
+                if href and any(href.lower().endswith(ext) for ext in (".tif", ".tiff", ".png", ".jpg")):
+                    # Walk up to find parent section name
+                    section_name = ""
+                    rasters.append({
+                        "path": href,
+                        "mime": mime,
+                        "role": role,
+                        "section_name": section_name,
+                    })
+
+    # Fallback: scan all entries directly
+    if not rasters:
+        for info in zf.infolist():
+            if any(info.filename.lower().endswith(ext) for ext in (".tif", ".tiff", ".png")):
+                rasters.append({
+                    "path": info.filename,
+                    "mime": "",
+                    "role": "raster",
+                    "section_name": "",
+                })
+
+    return rasters
+
+
+def ocr_image_bytes(image_bytes: bytes, lang: str = "heb+eng") -> str:
+    """
+    Run Tesseract OCR on raw image bytes (TIFF, PNG, etc.).
+
+    Args:
+        image_bytes: raw image data
+        lang: Tesseract language string (e.g. "heb+eng", "eng")
+
+    Returns plain text string. Raises ImportError if pytesseract/Pillow missing.
+    """
+    import pytesseract  # type: ignore
+    from PIL import Image  # type: ignore
+    import io
+
+    if _TESSERACT_PATH:
+        pytesseract.pytesseract.tesseract_cmd = _TESSERACT_PATH
+
+    # Try requested lang, fall back to eng if heb not installed
+    try:
+        langs_available = pytesseract.get_languages()
+    except Exception:
+        langs_available = ["eng"]
+
+    usable = [l for l in lang.split("+") if l in langs_available]
+    if not usable:
+        usable = ["eng"]
+    use_lang = "+".join(usable)
+
+    img = Image.open(io.BytesIO(image_bytes))
+    text = pytesseract.image_to_string(img, lang=use_lang, config="--psm 1")
+    return text
+
+
+def ocr_dwf_rasters(zf: zipfile.ZipFile, section_index: Optional[int] = None,
+                    lang: str = "heb+eng") -> list:
+    """
+    OCR all raster images in a DWF, returning text items.
+
+    Args:
+        section_index: if given, limit to rasters whose path starts with that section prefix
+        lang: Tesseract language string
+
+    Returns list of dicts: {text, source_file, backend, page}
+    """
+    rasters = extract_raster_sections(zf)
+
+    # Filter by section if requested
+    if section_index is not None:
+        manifest = parse_manifest(zf)
+        secs = manifest["sections"]
+        if 0 <= section_index < len(secs):
+            prefix = secs[section_index].get("name", "").replace("\\", "/")
+            rasters = [r for r in rasters if r["path"].startswith(prefix)]
+
+    items = []
+    for raster in rasters:
+        path = raster["path"]
+        names = {info.filename for info in zf.infolist()}
+        if path not in names:
+            continue
+        try:
+            img_bytes = zf.read(path)
+            text = ocr_image_bytes(img_bytes, lang=lang)
+            text = text.strip()
+            if text:
+                items.append({
+                    "text": text,
+                    "source_file": path,
+                    "role": raster["role"],
+                    "backend": "tesseract",
+                    "x": None,
+                    "y": None,
+                    "layer": None,
+                    "font": None,
+                    "height": None,
+                    "section_index": section_index,
+                })
+        except Exception:
+            continue
+
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -1018,13 +1185,31 @@ def get_dwf_text(filepath: str, section_index: Optional[int] = None) -> dict:
         try:
             text_items = extract_xml_text(zf, section_path)
             backend = "stdlib"
-            if not text_items:
-                note = (
-                    "No text found in XML resources. "
-                    "Binary W2D text requires ODA File Converter or aspose-cad."
-                )
         finally:
             zf.close()
+
+    # Tier 0.5: Tesseract OCR on raster images (TIFF/PNG embedded in DWF)
+    if not text_items and TESSERACT_AVAILABLE:
+        zf = open_dwf_zip(filepath)
+        try:
+            text_items = ocr_dwf_rasters(zf, section_index)
+            if text_items:
+                backend = "tesseract"
+            else:
+                note = (
+                    "No text found via OCR or XML. "
+                    "Vector W2D text requires ODA File Converter or aspose-cad."
+                )
+        except Exception as e:
+            note = f"OCR failed ({e}). Vector W2D text requires ODA or aspose-cad."
+        finally:
+            zf.close()
+
+    if not text_items and not note:
+        note = (
+            "No text found in XML resources. "
+            "Binary W2D text requires ODA File Converter or aspose-cad."
+        )
 
     # Add section_index field to each item if not present
     for item in text_items:
