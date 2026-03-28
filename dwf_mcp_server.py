@@ -1,12 +1,13 @@
 """
 dwf_mcp_server.py - MCP server for reading DWF (Design Web Format) files.
 
-Exposes five tools to Claude:
+Exposes six tools to Claude:
   read_dwf_info      - metadata, page count, sections
   list_dwf_layers    - layer names and visibility
   extract_dwf_text   - text entities from the drawing
   extract_dwf_geometry - geometry summary (entity counts, extents)
   read_dwf_page      - full details for one specific page/section
+  read_pdf_text      - extract text from a PDF (direct + embedded-image OCR)
 
 Run this server:
     python dwf_mcp_server.py
@@ -194,6 +195,39 @@ def read_dwf_page(filepath: str, section_index: int) -> dict:
     except ValueError as e:
         return {"error": "INVALID_SECTION" if "section_index" in str(e) else "INVALID_DWF",
                 "message": str(e)}
+    except PermissionError:
+        return {"error": "PERMISSION_DENIED", "message": f"Cannot read: {filepath}"}
+    except Exception as e:
+        return {"error": "UNEXPECTED", "message": str(e), "type": type(e).__name__}
+
+
+@mcp.tool()
+def read_pdf_text(filepath: str) -> dict:
+    """
+    Extract text from a PDF file.
+
+    Uses two strategies in sequence and combines results:
+      1. Direct text layer extraction (fast, zero-loss — works if PDF has embedded text)
+      2. OCR on every embedded image inside the PDF (catches title blocks, stamps,
+         labels, and architectural annotations that were rendered as raster images)
+
+    This is especially useful for PDFs exported from DWF via Autodesk Design Review,
+    which produce rasterized PDFs with no text layer but may still contain embedded
+    image fragments (logos, title blocks, form labels) that are OCR-readable.
+
+    Returns:
+        text_items: list of {text, page, image_name, backend, ...}
+        text_count: total items found
+        backend: which method(s) provided data
+        note: explanation if nothing was found
+
+    Args:
+        filepath: Path to the .pdf file.
+    """
+    try:
+        return dwf_reader.get_pdf_text(filepath)
+    except FileNotFoundError:
+        return {"error": "FILE_NOT_FOUND", "message": f"File not found: {filepath}"}
     except PermissionError:
         return {"error": "PERMISSION_DENIED", "message": f"Cannot read: {filepath}"}
     except Exception as e:

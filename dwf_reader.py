@@ -688,6 +688,131 @@ def ocr_dwf_rasters(zf: zipfile.ZipFile, section_index: Optional[int] = None,
 
 
 # ---------------------------------------------------------------------------
+# Tier 0.5b: OCR on embedded images inside a PDF (e.g. DWF printed via Design Review)
+# ---------------------------------------------------------------------------
+
+def _check_pymupdf() -> bool:
+    """Return True if PyMuPDF (fitz) is available."""
+    return importlib.util.find_spec("fitz") is not None
+
+
+PYMUPDF_AVAILABLE: bool = _check_pymupdf()
+
+
+def _ocr_lang_string(tess) -> str:
+    """Build best available language string (heb+eng preferred)."""
+    try:
+        available = tess.get_languages()
+    except Exception:
+        available = ["eng"]
+    usable = [l for l in ("heb", "eng") if l in available]
+    return "+".join(usable) if usable else "eng"
+
+
+def _is_quality_text(text: str, min_chars: int = 3, min_ratio: float = 0.35) -> bool:
+    """Return True if text looks like real content (not OCR noise from lines)."""
+    stripped = text.strip()
+    if len(stripped) < min_chars:
+        return False
+    meaningful = sum(1 for c in stripped if c.isalpha() or c.isdigit())
+    if len(stripped) == 0 or meaningful / len(stripped) < min_ratio:
+        return False
+    return any(c.isalpha() for c in stripped)
+
+
+def ocr_pdf_embedded_images(pdf_path: str, lang: str = "heb+eng") -> list:
+    """
+    Extract text from every image embedded inside a PDF page, using Tesseract OCR.
+
+    Unlike whole-page OCR, this targets individual embedded images (logos, title blocks,
+    labels) so that architectural drawing lines don't interfere with text detection.
+
+    Args:
+        pdf_path: path to the PDF file
+        lang: Tesseract language string (e.g. "heb+eng")
+
+    Returns list of dicts: {text, source_file, image_name, width, height, backend}
+    Raises ImportError if fitz or pytesseract/Pillow are missing.
+    """
+    import fitz  # PyMuPDF
+    import pytesseract  # type: ignore
+    from PIL import Image  # type: ignore
+    import io as _io
+
+    if _TESSERACT_PATH:
+        pytesseract.pytesseract.tesseract_cmd = _TESSERACT_PATH
+
+    use_lang = _ocr_lang_string(pytesseract)
+
+    items = []
+    doc = fitz.open(pdf_path)
+
+    for page_num, page in enumerate(doc):
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            name = img_info[7] or f"img{xref}"
+            pw, ph = img_info[2], img_info[3]
+
+            # Skip very small images (icons, bullets, separators)
+            if pw < 30 or ph < 10:
+                continue
+
+            try:
+                img_dict = doc.extract_image(xref)
+                raw = img_dict["image"]
+            except Exception:
+                continue
+
+            try:
+                img = Image.open(_io.BytesIO(raw)).convert("RGB")
+                iw, ih = img.size
+
+                # Scale up small images so Tesseract can read them better
+                scale = 1
+                if max(iw, ih) < 300:
+                    scale = max(1, 300 // max(iw, ih))
+                elif max(iw, ih) < 150:
+                    scale = 4
+                if scale > 1:
+                    img = img.resize((iw * scale, ih * scale), Image.LANCZOS)
+
+                raw_text = pytesseract.image_to_string(
+                    img,
+                    lang=use_lang,
+                    config="--psm 6 --oem 1",
+                )
+            except Exception:
+                continue
+
+            # Keep only quality lines
+            good_lines = []
+            for line in raw_text.split("\n"):
+                norm = " ".join(line.split())
+                if _is_quality_text(norm):
+                    good_lines.append(norm)
+
+            if good_lines:
+                items.append({
+                    "text": "\n".join(good_lines),
+                    "source_file": pdf_path,
+                    "image_name": name,
+                    "width": pw,
+                    "height": ph,
+                    "page": page_num,
+                    "backend": "tesseract-pdf-images",
+                    "x": None,
+                    "y": None,
+                    "layer": None,
+                    "font": None,
+                    "height_pts": None,
+                    "section_index": None,
+                })
+
+    doc.close()
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Tier 1: aspose-cad (optional, commercial)
 # ---------------------------------------------------------------------------
 
@@ -1317,4 +1442,98 @@ def get_dwf_page(filepath: str, section_index: int) -> dict:
         "text_items": text_result["text_items"],
         "geometry_summary": geo_result["geometry_summary"],
         "backend": geo_result["backend"],
+    }
+
+
+def get_pdf_text(filepath: str) -> dict:
+    """
+    Extract text from a PDF file.
+
+    Strategy:
+      1. Direct text extraction via PyMuPDF (fast; works only if PDF has a text layer)
+      2. OCR on each embedded image inside the PDF (catches title blocks, labels, stamps)
+
+    Args:
+        filepath: path to a .pdf file
+
+    Returns:
+        {
+            "text_items": [{text, image_name, width, height, page, backend, ...}],
+            "text_count": int,
+            "backend": str,
+            "note": str | None,
+        }
+    """
+    if not PYMUPDF_AVAILABLE:
+        return {
+            "text_items": [],
+            "text_count": 0,
+            "backend": "none",
+            "note": "PyMuPDF (fitz) is not installed. Run: pip install pymupdf",
+        }
+
+    import fitz
+
+    text_items = []
+    backend = "pymupdf"
+    note = None
+
+    # --- Step 1: direct text layer ---
+    try:
+        doc = fitz.open(filepath)
+        for page_num, page in enumerate(doc):
+            blocks = page.get_text("blocks")
+            for b in blocks:
+                raw = (b[4] or "").strip()
+                if raw and _is_quality_text(raw, min_chars=3, min_ratio=0.3):
+                    for line in raw.split("\n"):
+                        norm = " ".join(line.split())
+                        if _is_quality_text(norm):
+                            text_items.append({
+                                "text": norm,
+                                "source_file": filepath,
+                                "image_name": None,
+                                "width": None,
+                                "height": None,
+                                "page": page_num,
+                                "backend": "pymupdf-text",
+                                "x": b[0],
+                                "y": b[1],
+                                "layer": None,
+                                "font": None,
+                                "height_pts": None,
+                                "section_index": None,
+                            })
+        doc.close()
+        if text_items:
+            backend = "pymupdf-text"
+    except Exception as e:
+        note = f"PyMuPDF text extraction failed: {e}"
+
+    # --- Step 2: OCR on embedded images (always run, merges results) ---
+    if TESSERACT_AVAILABLE:
+        try:
+            ocr_items = ocr_pdf_embedded_images(filepath)
+            if ocr_items:
+                text_items.extend(ocr_items)
+                backend = "pymupdf-text+tesseract" if text_items else "tesseract"
+            elif not text_items:
+                note = (
+                    "No text found via direct extraction or embedded-image OCR. "
+                    "The PDF may contain only rasterized content without detectable text."
+                )
+        except Exception as e:
+            if not text_items:
+                note = f"OCR on embedded images failed: {e}"
+    elif not text_items:
+        note = (
+            "No text layer found in PDF. Install pytesseract + Tesseract-OCR "
+            "to enable embedded-image OCR."
+        )
+
+    return {
+        "text_items": text_items,
+        "text_count": len(text_items),
+        "backend": backend,
+        "note": note,
     }
